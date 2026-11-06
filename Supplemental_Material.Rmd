@@ -1,0 +1,234 @@
+---
+title: "Supplemental Online Material -- R script for 'Causal Mediation Analysis for Psychological Research: Insights From the Forward Testing Effect Study'"
+author: 
+date: 
+output: 
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+    number_sections: false
+    code_folding: show
+---
+
+# Initial Setup
+
+## Analysis setup
+
+Data from the Forward Testing Effect (hereafter FTE) study can be accessed at an anonymized repository at: https://osf.io/jyrq8/?view_only=ede69ce309484a40bc50904358e7abb7.
+
+Most of the data setup follows `FTE14a__mother_script.Rmd` found in the original repository.
+
+```{r setup, error=FALSE, warning=FALSE, message=FALSE}
+# 1. Set paths to specific folders in the working directory
+data.path <- "data/"
+
+# 2. Load packages
+packages <- c("knitr", "tidyverse", "psych", "ggplot2", "rstatix", "doParallel", "car",
+              "kableExtra", "mediation")
+
+# automatically tries to retrieve packages that are not yet installed.
+package.check <- lapply(packages, function(x) {
+  if (!require(x, character.only = TRUE)) {
+    install.packages(x, dependencies = TRUE)
+    library(x, character.only = TRUE)
+  }
+})
+
+# 3. Load data
+df <- read.csv2(file.path(data.path, "fet14a_data_osf.csv"))
+
+# 4. Some general settings that can be kept constant
+# general behavior of chunk (outputs)
+knitr::opts_chunk$set(
+  warning = F, # suppress warnings and 
+  message = F  # messages 
+  )
+
+# kable output 
+options(knitr.kable.NA = '')
+
+# settings to run analyses on multiple cores
+no.cores = parallel::detectCores() - 4  # 8
+cl = makeCluster(rep("localhost", no.cores))  # run all workers on local machine, 8 times
+```
+
+## Data preparations
+
+`practice_type` is treated as a factor and change in cognitive effort is calculated as the difference score between `cognitive.effort_text1` and `cognitive.effort_text3`. `practice_type_bi` is a dummy variable with Restudy = 0, Retrieval = 1.
+
+```{r data preps}
+# Create factor and DeltaCE (cognitive.effort_diff)
+df <- df %>%
+  mutate(
+    practice_type = factor(practice_type, levels = c("Restudy", "Retrieval")),
+    cognitive.effort_diff = cognitive.effort_text1 - cognitive.effort_text3)
+
+# Data cleaning to create dummy variable for practice type
+df <- df %>%
+  mutate(practice_type_bi = ifelse(practice_type == "Restudy", 0, 1))
+
+# Create gender dummy variables for descriptive statistics and mediation analysis
+df$male <- ifelse(df$gender == "male", 1, 0)
+df$diverse <- ifelse(df$gender == "diverse", 1, 0)
+```
+
+## Data exclusion
+
+Participants were excluded following the original FTE study if participants reported
+
+- high disturbance (> 7) and low concentration (< 4) ($n = 8$),
+- use of external help (e.g., taking notes) ($n = 8$),
+- same study participation ($n = 4$), or
+- language other than German ($n = 13$).
+
+In total, data from 33 subjects were excluded from our analysis. 
+
+```{r exclusion}
+# Filter a subset of subjects based on exclusion criteria 
+Excl <- df %>%
+  mutate(
+    Excl_dist = disturbed > 7 & concentration < 4, 
+    Excl_help = external.help == "yes",
+    Excl_same.study = participated.before == "I have participated at the SAME study before.",
+    Excl_language = language == "other") %>%
+  
+  filter(Excl_dist == T | 
+           Excl_help == T |
+           Excl_same.study == T | 
+           Excl_language == T)
+
+# Apply exclusion criteria
+df <- df %>%
+  filter(!(ID %in% Excl$ID))  # 308 -> 275
+```
+
+## Descriptive statistics (Table 1)
+
+Below are descriptive statistics of variables used in further analyses (presented as Table 1 in the manuscript).
+
+```{r, overall sample}
+# Overall sample
+library(psych)
+describe(df[, c("practice_type_bi", "cognitive.effort_diff", 
+                "cognitive.effort_text1", "cognitive.effort_text3",
+                "test.final_text3_sum", "interest_text1", 
+                "prior.knowledge_text1", "episodic.memory_acc",
+                "sellmo_learninggoals", "male", "diverse", 
+                "age")])[, c(2:5, 8:9, 11:12)]
+```
+
+```{r, by practice type}
+# Descriptive statistics by practice type
+describeBy(df[, c("cognitive.effort_diff", "cognitive.effort_text1", 
+                  "cognitive.effort_text3", "test.final_text3_sum", 
+                  "interest_text1", "prior.knowledge_text1", 
+                  "episodic.memory_acc", "sellmo_learninggoals", "male", 
+                  "diverse", "age")], df$practice_type)
+```
+Also, covariate distributions are compared for balance between the restudy and retrieval conditions. Other than key variables, the covariates do not show meaningful differences between the practice type conditions.
+
+```{r, two-sample t-tests for covariates}
+# Two-sample t-tests for comparing covariate distributions by practice type
+t.test(cognitive.effort_diff ~ practice_type, data = df, 
+       var.equal = FALSE)  # t(261.71) = 2.074, p = 0.039
+t.test(cognitive.effort_text1 ~ practice_type, data = df, var.equal = FALSE)
+t.test(cognitive.effort_text3 ~ practice_type, data = df, 
+       var.equal = FALSE)  # t(272.49) = -1.825, p = 0.069
+t.test(test.final_text3_sum ~ practice_type, data = df, 
+       var.equal = FALSE)  # t(272.66) = -2.970, p = 0.003
+t.test(interest_text1 ~ practice_type, data = df, var.equal = FALSE)
+t.test(prior.knowledge_text1 ~ practice_type, data = df, var.equal = FALSE)
+t.test(episodic.memory_acc ~ practice_type, data = df, var.equal = FALSE)
+t.test(sellmo_learninggoals ~ practice_type, data = df, var.equal = FALSE)
+t.test(male ~ practice_type, data = df, var.equal = FALSE)
+t.test(diverse ~ practice_type, data = df, var.equal = FALSE)
+t.test(age ~ practice_type, data = df, var.equal = FALSE)
+```
+
+
+# Mediation Analysis
+
+## Mediator model specification
+Retrieval leads to less change in cognitive effort (cognitive effort after learning block 1 - after learning block 3), supporting the first part of the encoding hypothesis.
+
+```{r, mediator model}
+# Mediator model
+med.fit <- lm(cognitive.effort_diff ~ practice_type_bi, data = df)
+summary(med.fit)
+```
+
+## Outcome model specification (Table 2)
+
+We examine interest (`interest_text1`), prior knowledge (`prior.knowledge_text1`), episodic memory (`episodic.memory_acc`), learning goals (`sellmo_learninggoals`), as well as some demographics (`gender`, `age`) as potential confounders.
+
+mediation::mediate() does not work well with factors with more than two levels. Therefore, we replace `gender` with dummy indicators `male` and `diverse`, leaving `female` as the reference group.
+
+```{r, outcome model with T-M interaction}
+# Outcome model with T-M interaction and covariate adjustment
+out.fit.tm <- lm(test.final_text3_sum ~ practice_type_bi * cognitive.effort_diff +
+                       interest_text1 + prior.knowledge_text1 + 
+                       episodic.memory_acc + sellmo_learninggoals + 
+                       male + diverse + age,
+                     data = df)
+summary(out.fit.tm)
+```
+
+Ignoring the treatment-mediator interaction (between practice type and change in cognitive effort) assumes constant relationships between the key variables of a mediation analysis.
+
+```{r, outcome model without T-M interaction}
+# cf) Outcome model with only covariates and without T-M interaction
+out.fit.cov.only <- lm(test.final_text3_sum ~ practice_type_bi + cognitive.effort_diff +
+                       interest_text1 + prior.knowledge_text1 + 
+                       episodic.memory_acc + sellmo_learninggoals + 
+                       male + diverse + age,
+                     data = df)
+summary(out.fit.cov.only)
+```
+
+## (In)direct effect estimation (Table 3)
+
+(In)direct effects are estimated based on estimates from the mediator and outcome models. Confidence intervals are estimated using the bias corrected and accelerated (BCa) bootstrap with 10,000 bootstrap samples. A seed is specified for replication purposes.
+
+Among the results, we examine
+
+- ACME (control): Standalone indirect effect
+- ACME (treated): Complementary indirect effect
+- ADE (treated): Complementary direct effect
+
+, supporting FTE-specific research questions. 
+
+```{r, (in)direct effect estimation}
+# Estimate mediation effects using mediation::mediate()
+# Seed setting is needed because it relies on Monte Carlo draws of potential mediators/outcomes
+set.seed(54321)
+med.estimation <- mediate(med.fit, out.fit.tm, 
+                          treat = "practice_type_bi", 
+                          mediator = "cognitive.effort_diff", 
+                          boot = TRUE, boot.ci.type = "bca", sims = 10000)
+summary(med.estimation)
+```
+
+## Sensitivity analysis (Figure 6)
+
+We complement our mediation analysis with a series of sensitivity analyses on the degree of omitted confounding between the mediator and outcome, represented by the sensitivity parameter $\rho$ (Imai, Keele, Tingley, 2010, Psychological Methods).
+
+```{r, sensitivity analysis}
+# Sensitivity analysis for M-Y confounders
+set.seed(12345)
+sens.out <- medsens(med.estimation, rho.by = 0.1, sims = 10000, 
+                    effect.type = "both")
+summary(sens.out)
+```
+
+Based on the sensitivity analysis results, we can draw sensitivity plots for our (in)direct effect estimates. Among these, we examine
+
+- $ACME_0(\rho)$: Standalone indirect effect
+- $ACME_1(\rho)$: Complementary indirect effect
+- $ADE_1(\rho)$: Complementary direct effect
+
+```{r, sensitivity plots}
+# Sensitivity plots
+plot(sens.out, sens.par = "rho")
+```
+
